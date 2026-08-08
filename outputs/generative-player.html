@@ -79,6 +79,14 @@
     /* Edge of the body radial wash — a slightly darker version of g1. Set by
        JS so the vignette always matches the active piece. */
     --bg-edge:#143c54;
+    /* v2.3 — breathing gradient. Driven every frame from drawSky() by a
+       slow sine wave (see BREATH below). g2's stop position drifts a
+       few % up and down around 55%, and g1/g3's stop positions drift
+       oppositely by a smaller amount — the gradient's "waistline"
+       rises and falls like a slow tide instead of sitting static. */
+    --g1-pos:0%;
+    --g2-pos:55%;
+    --g3-pos:100%;
     /* --active-rgb-anim is set dynamically — used wherever we want
        the active piece's mid-stop colour with transition support. */
     --active-rgb-anim:#2a8aa8;
@@ -136,10 +144,17 @@
   body{
     margin:0;
     background: linear-gradient(180deg,
-      var(--g1) 0%,
-      var(--g2) 55%,
-      var(--g3) 100%);
+      var(--g1) var(--g1-pos),
+      var(--g2) var(--g2-pos),
+      var(--g3) var(--g3-pos));
     background-attachment: fixed;
+    /* v2.3 — the *-pos vars are updated every frame by JS for the
+       breathing effect, so they must NOT be in this transition list —
+       animating a %-position transition at 60fps via CSS would fight
+       the JS updates and stutter. Colour swaps between pieces still
+       transition smoothly via the base `background` property below;
+       the pos vars change too fast/continuously for a CSS transition
+       to make sense. */
     transition:background 0.8s cubic-bezier(0.25, 0.46, 0.45, 0.94);
     color:var(--ink);
     font-family: system-ui, -apple-system, "SF Pro Display", "SF Pro Text",
@@ -3755,6 +3770,75 @@ function sizeSky(){
 window.addEventListener('resize', sizeSky);
 sizeSky();
 
+/* v2.5 — subtle film grain. Rather than generating per-pixel noise
+   every frame (expensive at full-viewport size, 60fps), pre-render a
+   handful of tileable noise patches once, then cycle between them a
+   few times a second and paint each as a repeating pattern over the
+   whole canvas. Cycling between pre-rendered tiles (instead of
+   redrawing one static tile forever) gives the "flickering analog
+   film" quality real grain has, at a fraction of the cost of live
+   per-pixel noise.
+   v2.4 shipped this too strong: full 0-255 luminance contrast at
+   0.55 alpha made the repeating 128px tile visibly seam, and read as
+   a heavy static overlay rather than texture. v2.5 fixes both:
+     - tile is much larger (384px) so the eye can't easily perceive
+       the repeat across a normal viewport
+     - noise is narrow-band (values clustered near mid-grey, not full
+       black-to-white) so adjacent tile edges blend rather than seam
+     - alpha is much lower and the blend mode softened, so grain adds
+       texture without dominating the frame */
+const GRAIN_TILE_SIZE = 384;
+const GRAIN_TILE_COUNT = 5;
+const GRAIN_FPS = 10;             // how often the tile swaps, not the draw fps
+const grainTiles = [];
+(function buildGrainTiles(){
+  for (let n = 0; n < GRAIN_TILE_COUNT; n++){
+    const tc = document.createElement('canvas');
+    tc.width = GRAIN_TILE_SIZE; tc.height = GRAIN_TILE_SIZE;
+    const tx = tc.getContext('2d');
+    const img = tx.createImageData(GRAIN_TILE_SIZE, GRAIN_TILE_SIZE);
+    const d = img.data;
+    for (let i = 0; i < d.length; i += 4){
+      /* Monochrome noise, narrow-band around mid-grey (110-145 rather
+         than 0-255) — this is what keeps the tile boundary from
+         seaming: neighbouring tiles never juxtapose a near-black
+         pixel against a near-white one at the seam, since no pixel
+         is ever near either extreme. Alpha also kept in a tighter,
+         lower band so the texture reads as a fine grain, not spots. */
+      const v = 90 + Math.random() * 75;
+      d[i] = d[i+1] = d[i+2] = v;
+      d[i+3] = 28 + Math.random() * 75;   // alpha 28..103 per pixel
+    }
+    tx.putImageData(img, 0, 0);
+    grainTiles.push(tc);
+  }
+})();
+let _grainPatternCache = new Map();
+function grainPattern(idx){
+  if (!_grainPatternCache.has(idx)){
+    _grainPatternCache.set(idx, sx.createPattern(grainTiles[idx], 'repeat'));
+  }
+  return _grainPatternCache.get(idx);
+}
+let _lastGrainSwap = 0, _grainIdx = 0;
+function drawGrain(now, W, H){
+  if (now - _lastGrainSwap > 1000 / GRAIN_FPS){
+    _lastGrainSwap = now;
+    _grainIdx = (_grainIdx + 1) % GRAIN_TILE_COUNT;
+  }
+  sx.save();
+  /* 'overlay' lets the grain darken shadows and lighten highlights of
+     whatever's beneath (gradient, dots, ripples) rather than just
+     sitting on top as a flat haze — this is what makes film grain
+     read as texture instead of a translucent sticker. Alpha is now
+     low enough that this stays a whisper of texture, not a layer. */
+  sx.globalCompositeOperation = 'overlay';
+  sx.globalAlpha = 0.40;   // bumped up again — user wants it a bit more obvious
+  sx.fillStyle = grainPattern(_grainIdx);
+  sx.fillRect(0, 0, W, H);
+  sx.restore();
+}
+
 /* Pre-compute a small set of "interesting" anchor points (golden-ratio
    lattice, scaled to viewport) so 30% of stars cluster there and 70%
    scatter uniformly. Avoids pure-noise feel without making the field
@@ -3823,12 +3907,65 @@ function spawnStar(velocity){
     stars.push({
       x: pos.x, y: pos.y,
       born: now + Math.random() * 200,   // tiny stagger so group doesn't pop together
-      life: 3500 + Math.random() * 2500, // 3.5..6 s
+      life: 1400 + Math.random() * 900,  // 1.4..2.3 s — quick fade, ripple carries the tail
       baseR: 1.5 + Math.random() * 1.0,
       peakR: 3.0 + v * 2.0,              // peak 3.0..5.0 px
       rgb,
       peakAlpha: 0.55 + v * 0.25,        // 0.55..0.80 — visible
       delay: Math.random() * 120,
+    });
+    /* v2.0 — every data dot also emits an expanding ripple from the
+       same origin point, so the dot reads as a "sound register" that
+       pulses outward rather than just fading in place. */
+    spawnRipple(pos, v, rgb, now);
+  }
+}
+
+/* v2.2 — ripple rings, slow and zen. Each dot spawns 1-2 rings that
+   expand outward from roughly its origin and fade, like a wave
+   spreading on still water. No wobble — a wobbling edge read as
+   nervous/jittery rather than calm, so the ring is a smooth ellipse.
+   Three sources of quiet variation keep every ripple visually
+   distinct without adding visual noise:
+     1. Independent size scatter — maxR has its own randomness on
+        top of velocity, so same-velocity notes still look different.
+     2. Off-center rings — each ring in a pair gets a small random
+        center offset from the dot, so multi-ring notes feel like
+        overlapping ripples, not a stacked target.
+     3. Ellipse — radius is stretched unevenly on two roughly-
+        perpendicular axes, so rings are gently oval, never perfect
+        circles, with a random rotation so the stretch direction
+        varies note to note.
+   Kept separate from `stars` (the glow dots) so both layers can be
+   tuned independently. */
+const ripples = [];
+function spawnRipple(pos, v, rgb, now){
+  const ringCount = 1 + (v > 0.4 ? 1 : 0);    // 2 rings for most notes, not just loud ones
+  for (let i = 0; i < ringCount; i++){
+    /* Size scatter: velocity sets a baseline, but each ring rolls its
+       own multiplier (0.7..1.3x) so identical velocity never produces
+       identical size. */
+    const sizeScatter = 0.7 + Math.random() * 0.6;
+    const baseR = (70 + v * 90) * sizeScatter;   // ~49..250px depending on v + scatter
+    /* Small random center offset per ring — a few px, enough to feel
+       like a second overlapping ripple rather than a nested circle. */
+    const offR = 3 + Math.random() * 7;
+    const offA = Math.random() * Math.PI * 2;
+    /* Ellipse stretch — one axis longer than the other, at a random
+       rotation, so the ring is a soft oval rather than a perfect
+       circle. Stretch stays mild (max ~18%) to avoid looking egg-shaped. */
+    const stretch = 1 + Math.random() * 0.18;
+    const rotation = Math.random() * Math.PI;
+    ripples.push({
+      x: pos.x + Math.cos(offA) * offR,
+      y: pos.y + Math.sin(offA) * offR,
+      born: now + i * 600,                // second ring trails well behind — unhurried
+      life: 7000 + Math.random() * 3000,  // 7..10 s — slow, meditative outward travel
+      maxR: baseR,
+      stretch, rotation,
+      rgb,
+      peakAlpha: (0.5 + v * 0.2) * (0.85 + Math.random() * 0.3), // slight per-ring alpha scatter too
+      lineWidth: 1.5 + v * 1,             // thinner — a quiet line, not a bold stroke
     });
   }
 }
@@ -3860,6 +3997,36 @@ if (typeof Tone !== 'undefined' && Tone.PolySynth) attachSkyHook(Tone.PolySynth.
    v1.4 — also updates the bottom drawer #duration element every frame
    while playing. */
 let _lastDurText = '';
+/* v2.4 — breathing gradient. Three slow, slightly-out-of-phase sine
+   waves drift the gradient's stop positions around their resting
+   values, so the whole page reads as slowly inhaling and exhaling
+   rather than sitting static. v2.3's amplitude/period were too
+   subtle to actually perceive; this pass widens the swing and
+   shortens the period so a full breath is noticeable within a few
+   seconds of watching, while still reading as calm drift rather than
+   an obvious animation. Different periods per stop (rather than one
+   shared phase) avoid the whole gradient moving as one rigid block,
+   which would read as scrolling rather than breathing. */
+const BREATH = {
+  g1: { period: 8000,  amp: 12, phase: 0 },
+  g2: { period: 9500,  amp: 16, phase: Math.PI * 0.6 },
+  g3: { period: 11000, amp: 9,  phase: Math.PI * 1.2 },
+};
+const bodyStyle = document.documentElement.style;
+let _lastBreathUpdate = 0;
+function updateBreath(now){
+  /* Updating a CSS var every single frame is unnecessary work for
+     something this slow — throttle to ~20fps, which is still far
+     more than smooth enough for a multi-second sine drift. */
+  if (now - _lastBreathUpdate < 50) return;
+  _lastBreathUpdate = now;
+  const g1pos = 0  + Math.sin(now / BREATH.g1.period * Math.PI * 2 + BREATH.g1.phase) * BREATH.g1.amp;
+  const g2pos = 55 + Math.sin(now / BREATH.g2.period * Math.PI * 2 + BREATH.g2.phase) * BREATH.g2.amp;
+  const g3pos = 100 + Math.sin(now / BREATH.g3.period * Math.PI * 2 + BREATH.g3.phase) * BREATH.g3.amp * 0.5;
+  bodyStyle.setProperty('--g1-pos', g1pos.toFixed(2) + '%');
+  bodyStyle.setProperty('--g2-pos', g2pos.toFixed(2) + '%');
+  bodyStyle.setProperty('--g3-pos', Math.min(100, g3pos).toFixed(2) + '%');
+}
 (function drawSky(){
   requestAnimationFrame(drawSky);
   if(playStartMs > 0 && $duration){
@@ -3869,6 +4036,32 @@ let _lastDurText = '';
   const W = window.innerWidth, H = window.innerHeight;
   sx.clearRect(0, 0, W, H);
   const now = performance.now();
+  updateBreath(now);
+  /* Ripples drawn first (behind the dots) so the dot reads as the
+     origin point the rings are expanding from. */
+  for (let i = ripples.length - 1; i >= 0; i--){
+    const rp = ripples[i];
+    const t = (now - rp.born) / rp.life;
+    if (t >= 1){ ripples.splice(i, 1); continue; }
+    if (t < 0) continue;
+    /* Gentle ease-out — a soft, unhurried expansion (quadratic, not
+       cubic) so the ring drifts outward calmly rather than snapping
+       out and lingering. Alpha fades in parallel so the ring never
+       reads as a hard-edged circle. */
+    const ease = 1 - Math.pow(1 - t, 2);
+    const r = rp.maxR * ease;
+    const a = rp.peakAlpha * (1 - t);
+    if (r < 1) continue;
+    /* A smooth, calm ellipse — no wobble. The only variation is the
+       gentle stretch/rotation set at spawn time (see spawnRipple),
+       so the ring reads as a soft, still-water ripple rather than a
+       hand-drawn or jittery line. */
+    sx.beginPath();
+    sx.ellipse(rp.x, rp.y, r, r * rp.stretch, rp.rotation, 0, Math.PI * 2);
+    sx.lineWidth = rp.lineWidth;
+    sx.strokeStyle = `rgba(${rp.rgb[0]},${rp.rgb[1]},${rp.rgb[2]},${a})`;
+    sx.stroke();
+  }
   /* Walk backwards so we can splice in place. */
   for (let i = stars.length - 1; i >= 0; i--){
     const s = stars[i];
@@ -3890,6 +4083,9 @@ let _lastDurText = '';
     sx.fillStyle = `rgba(${s.rgb[0]},${s.rgb[1]},${s.rgb[2]},${a})`;
     sx.fill();
   }
+  /* Grain drawn last, on top of dots and ripples, so it textures the
+     whole frame uniformly rather than just the background. */
+  drawGrain(now, W, H);
 })();
 
 /* ---- boot: restore whatever the URL described ---- */
